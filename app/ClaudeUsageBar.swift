@@ -13,7 +13,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
-        NSLog("✅ App launched, notifications ready")
+        NSLog("App launched, notifications ready")
 
         // Create status bar item with variable length for compact display
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -35,17 +35,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create popover
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 260)
+        popover.contentSize = NSSize(width: 360, height: 340)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: UsageView(usageManager: usageManager))
 
-        // Fetch initial data
+        // Fetch initial data (the usage manager manages its own adaptive timer after the first fetch)
         usageManager.fetchUsage()
-
-        // Set up timer to refresh every 5 minutes
-        Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
-            self.usageManager.fetchUsage()
-        }
+        usageManager.scheduleRefreshTimer()
 
         // Set up Cmd+U keyboard shortcut
         setupKeyboardShortcut()
@@ -74,7 +70,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let trusted = AXIsProcessTrusted()
 
         if !trusted {
-            NSLog("⚠️ Accessibility permissions not granted")
+            NSLog("Accessibility permissions not granted")
             // Show alert to guide user
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 let alert = NSAlert()
@@ -91,7 +87,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         } else {
-            NSLog("✅ Accessibility permissions granted")
+            NSLog("Accessibility permissions granted")
         }
     }
 
@@ -135,9 +131,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
 
         if status == noErr {
-            NSLog("✅ Registered Cmd+U hotkey successfully")
+            NSLog("Registered Cmd+U hotkey successfully")
         } else {
-            NSLog("❌ Failed to register hotkey, status: \(status)")
+            NSLog("Failed to register hotkey, status: \(status)")
         }
     }
 
@@ -145,7 +141,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let hotKey = hotKeyRef {
             UnregisterEventHotKey(hotKey)
             hotKeyRef = nil
-            NSLog("🗑️ Unregistered Cmd+U hotkey")
+            NSLog("Unregistered Cmd+U hotkey")
         }
     }
 
@@ -319,6 +315,9 @@ class UsageManager: ObservableObject {
     private var sessionCookie: String = ""
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
+    private var lastNotifiedSessionExtraThreshold: Int = 0
+    private var lastObservedSessionUsage: Int = -1
+    var refreshTimer: Timer?
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
@@ -347,6 +346,8 @@ class UsageManager: ObservableObject {
         }
         openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
         lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
+        lastNotifiedSessionExtraThreshold = UserDefaults.standard.integer(forKey: "last_notified_session_extra_threshold")
+        lastObservedSessionUsage = (UserDefaults.standard.object(forKey: "last_observed_session_usage") as? Int) ?? -1
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
             shortcutEnabled = true
@@ -387,7 +388,11 @@ class UsageManager: ObservableObject {
         hasWeeklySonnet = false
         errorMessage = nil
         lastNotifiedThreshold = 0
+        lastNotifiedSessionExtraThreshold = 0
+        lastObservedSessionUsage = -1
         UserDefaults.standard.set(0, forKey: "last_notified_threshold")
+        UserDefaults.standard.set(0, forKey: "last_notified_session_extra_threshold")
+        UserDefaults.standard.removeObject(forKey: "last_observed_session_usage")
 
         // Update status bar to show 0%
         delegate?.updateStatusIcon(percentage: 0)
@@ -402,7 +407,7 @@ class UsageManager: ObservableObject {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("lastActiveOrg=") {
                 let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                NSLog("📋 Found org ID in cookie: \(orgId)")
+                NSLog("Found org ID in cookie: \(orgId)")
                 completion(orgId)
                 return
             }
@@ -418,18 +423,18 @@ class UsageManager: ObservableObject {
         request.httpMethod = "GET"
         request.setValue("sessionKey=\(sessionCookie)", forHTTPHeaderField: "Cookie")
 
-        NSLog("📡 Fetching bootstrap to get org ID...")
+        NSLog("Fetching bootstrap to get org ID...")
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let account = json["account"] as? [String: Any],
                   let lastActiveOrgId = account["lastActiveOrgId"] as? String else {
-                NSLog("❌ Could not parse org ID from bootstrap")
+                NSLog("Could not parse org ID from bootstrap")
                 completion(nil)
                 return
             }
-            NSLog("✅ Got org ID from bootstrap: \(lastActiveOrgId)")
+            NSLog("Got org ID from bootstrap: \(lastActiveOrgId)")
             completion(lastActiveOrgId)
         }.resume()
     }
@@ -483,14 +488,14 @@ class UsageManager: ObservableObject {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("claude.ai", forHTTPHeaderField: "authority")
 
-        NSLog("🔍 Fetching from: \(urlString)")
+        NSLog("Fetching from: \(urlString)")
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 self?.isLoading = false
 
                 if let error = error {
-                    NSLog("❌ Error: \(error.localizedDescription)")
+                    NSLog("Error: \(error.localizedDescription)")
                     self?.errorMessage = "Network error"
                     self?.updateStatusBar()
                     return
@@ -502,10 +507,10 @@ class UsageManager: ObservableObject {
                     return
                 }
 
-                NSLog("📡 Status: \(httpResponse.statusCode)")
+                NSLog("Status: \(httpResponse.statusCode)")
 
                 if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
+                    NSLog("Response: \(responseString)")
                 }
 
                 if httpResponse.statusCode == 200, let data = data {
@@ -526,7 +531,7 @@ class UsageManager: ObservableObject {
                 return
             }
 
-            NSLog("📊 Parsing usage data...")
+            NSLog("Parsing usage data...")
 
             let iso8601Formatter = ISO8601DateFormatter()
             iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -538,12 +543,12 @@ class UsageManager: ObservableObject {
                     sessionLimit = 100
                 }
                 if let resetsAtString = fiveHour["resets_at"] as? String {
-                    NSLog("🕐 Session resets_at string: \(resetsAtString)")
+                    NSLog("Session resets_at string: \(resetsAtString)")
                     if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
                         sessionResetsAt = resetsAt
-                        NSLog("✅ Parsed session reset time: \(resetsAt)")
+                        NSLog("Parsed session reset time: \(resetsAt)")
                     } else {
-                        NSLog("❌ Failed to parse session reset time")
+                        NSLog("Failed to parse session reset time")
                     }
                 }
             }
@@ -554,12 +559,12 @@ class UsageManager: ObservableObject {
                     weeklyLimit = 100
                 }
                 if let resetsAtString = sevenDay["resets_at"] as? String {
-                    NSLog("🕐 Weekly resets_at string: \(resetsAtString)")
+                    NSLog("Weekly resets_at string: \(resetsAtString)")
                     if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
                         weeklyResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly reset time: \(resetsAt)")
+                        NSLog("Parsed weekly reset time: \(resetsAt)")
                     } else {
-                        NSLog("❌ Failed to parse weekly reset time")
+                        NSLog("Failed to parse weekly reset time")
                     }
                 }
             }
@@ -572,12 +577,12 @@ class UsageManager: ObservableObject {
                     weeklySonnetLimit = 100
                 }
                 if let resetsAtString = sevenDaySonnet["resets_at"] as? String {
-                    NSLog("🕐 Weekly Sonnet resets_at string: \(resetsAtString)")
+                    NSLog("Weekly Sonnet resets_at string: \(resetsAtString)")
                     if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
                         weeklySonnetResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly Sonnet reset time: \(resetsAt)")
+                        NSLog("Parsed weekly Sonnet reset time: \(resetsAt)")
                     } else {
-                        NSLog("❌ Failed to parse weekly Sonnet reset time")
+                        NSLog("Failed to parse weekly Sonnet reset time")
                     }
                 }
             } else {
@@ -585,7 +590,7 @@ class UsageManager: ObservableObject {
             }
 
             // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")")
+            NSLog("Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")")
 
             lastUpdated = Date()
             errorMessage = nil
@@ -594,7 +599,7 @@ class UsageManager: ObservableObject {
             // Update percentage values for progress bars
             updatePercentages()
         } catch {
-            NSLog("❌ Parse error: \(error.localizedDescription)")
+            NSLog("Parse error: \(error.localizedDescription)")
             errorMessage = "Parse error"
         }
     }
@@ -605,15 +610,73 @@ class UsageManager: ObservableObject {
         // Update the icon color
         delegate?.updateStatusIcon(percentage: sessionPercent)
 
-        // Check for notification thresholds
+        // Check for notification thresholds (session: 5-hour, at 25/50/75/90)
         checkNotificationThresholds(percentage: sessionPercent)
+
+        // Check for session extra-usage notifications (99%+ = entering extra usage)
+        checkExtraUsageNotification(sessionUsage: sessionUsage)
+
+        // Adapt poll cadence — poll every minute when near/over cap so we catch chat turns
+        scheduleRefreshTimer()
+    }
+
+    func scheduleRefreshTimer() {
+        let desiredInterval: TimeInterval = sessionUsage >= 99 ? 60 : 300
+        if let existing = refreshTimer, abs(existing.timeInterval - desiredInterval) < 1 {
+            return // already running at the right cadence
+        }
+        refreshTimer?.invalidate()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: desiredInterval, repeats: true) { [weak self] _ in
+            self?.fetchUsage()
+        }
+        NSLog("Refresh timer: every \(Int(desiredInterval))s")
+    }
+
+    func checkExtraUsageNotification(sessionUsage currentSession: Int) {
+        guard notificationsEnabled else { return }
+
+        // First crossing of 99% — user is about to enter extra-usage territory
+        if currentSession >= 99 && lastNotifiedSessionExtraThreshold < 99 {
+            sendExtraUsageNotification(percentage: currentSession, isFirstCrossing: true)
+            lastNotifiedSessionExtraThreshold = 99
+            UserDefaults.standard.set(99, forKey: "last_notified_session_extra_threshold")
+        }
+
+        // Each subsequent tick up while already at 99%+ indicates a chat turn in extra usage
+        if currentSession >= 99 && lastObservedSessionUsage >= 99 && currentSession > lastObservedSessionUsage {
+            sendExtraUsageNotification(percentage: currentSession, isFirstCrossing: false)
+        }
+
+        // Reset flag if session dropped below 99 (5-hour reset)
+        if currentSession < 99 && lastNotifiedSessionExtraThreshold >= 99 {
+            lastNotifiedSessionExtraThreshold = 0
+            UserDefaults.standard.set(0, forKey: "last_notified_session_extra_threshold")
+        }
+
+        lastObservedSessionUsage = currentSession
+        UserDefaults.standard.set(currentSession, forKey: "last_observed_session_usage")
+        UserDefaults.standard.synchronize()
+    }
+
+    func sendExtraUsageNotification(percentage: Int, isFirstCrossing: Bool) {
+        let notification = NSUserNotification()
+        if isFirstCrossing {
+            notification.title = "Claude Session Limit Reached"
+            notification.informativeText = "You're at \(percentage)% of your 5-hour session. Further chat turns will count as extra usage."
+        } else {
+            notification.title = "Extra Usage — Chat Turn Sent"
+            notification.informativeText = "That turn used extra usage. Session: \(percentage)%."
+        }
+        notification.soundName = NSUserNotificationDefaultSoundName
+        NSUserNotificationCenter.default.deliver(notification)
+        NSLog("Extra usage notification sent (firstCrossing=\(isFirstCrossing), session=\(percentage)%)")
     }
 
     func checkNotificationThresholds(percentage: Int) {
-        NSLog("🔔 Checking notifications: percentage=\(percentage)%, enabled=\(notificationsEnabled), lastNotified=\(lastNotifiedThreshold)%")
+        NSLog("Checking notifications: percentage=\(percentage)%, enabled=\(notificationsEnabled), lastNotified=\(lastNotifiedThreshold)%")
 
         guard notificationsEnabled else {
-            NSLog("⚠️ Notifications disabled")
+            NSLog("Notifications disabled")
             return
         }
 
@@ -621,7 +684,7 @@ class UsageManager: ObservableObject {
 
         for threshold in thresholds {
             if percentage >= threshold && lastNotifiedThreshold < threshold {
-                NSLog("📬 Sending notification for \(threshold)% threshold")
+                NSLog("Sending notification for \(threshold)% threshold")
                 sendNotification(percentage: percentage, threshold: threshold)
                 lastNotifiedThreshold = threshold
                 // Persist the threshold
@@ -633,7 +696,7 @@ class UsageManager: ObservableObject {
         // Reset if usage drops below current threshold
         if percentage < lastNotifiedThreshold {
             let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
-            NSLog("🔄 Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
+            NSLog("Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
             lastNotifiedThreshold = newThreshold
             UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
             UserDefaults.standard.synchronize()
@@ -647,11 +710,11 @@ class UsageManager: ObservableObject {
         notification.soundName = NSUserNotificationDefaultSoundName
 
         NSUserNotificationCenter.default.deliver(notification)
-        NSLog("📬 Sent notification for \(threshold)% threshold")
+        NSLog("Sent notification for \(threshold)% threshold")
     }
 
     func sendTestNotification() {
-        NSLog("🔔 Test notification button clicked")
+        NSLog("Test notification button clicked")
 
         let notification = NSUserNotification()
         notification.title = "Claude Usage Alert"
@@ -659,7 +722,7 @@ class UsageManager: ObservableObject {
         notification.soundName = NSUserNotificationDefaultSoundName
 
         NSUserNotificationCenter.default.deliver(notification)
-        NSLog("📬 Test notification sent successfully")
+        NSLog("Test notification sent successfully")
     }
 
     @Published var sessionPercentage: Double = 0.0
@@ -806,6 +869,93 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+// Custom capsule progress bar with gradient fill.
+struct UsageBar: View {
+    let value: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.08))
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [color.opacity(0.75), color],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(4, geo.size.width * min(max(value, 0), 1.0)))
+            }
+        }
+        .frame(height: 8)
+    }
+}
+
+// One usage card: title, badge, bar, percentage, reset hint, optional warning.
+struct UsageCard: View {
+    let title: String
+    let badge: String
+    let percentage: Double
+    let resetText: String?
+    let showExtraUsageWarning: Bool
+
+    private var color: Color {
+        if percentage < 0.7 { return .green }
+        if percentage < 0.9 { return .orange }
+        return .red
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(badge)
+                    .font(.system(size: 9, weight: .medium))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.primary.opacity(0.08), in: Capsule())
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("\(Int(percentage * 100))%")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundColor(color)
+            }
+
+            UsageBar(value: percentage, color: color)
+
+            if let resetText = resetText {
+                Text(resetText)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+
+            if showExtraUsageWarning {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                    Text("Extra usage active")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .foregroundColor(.red)
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+    }
+}
+
 struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @State private var sessionCookieInput: String = ""
@@ -813,114 +963,118 @@ struct UsageView: View {
     @State private var showingSettings: Bool = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Claude Usage")
-                .font(.headline)
-                .padding(.bottom, 4)
+        VStack(alignment: .leading, spacing: 14) {
+            // Header
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [.orange, .pink],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                Text("Claude Usage")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                if usageManager.hasFetchedData {
+                    Button(action: { usageManager.fetchUsage() }) {
+                        Image(systemName: usageManager.isLoading ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Refresh")
+                }
+            }
 
             if let error = usageManager.errorMessage {
-                Text(error)
-                    .font(.caption)
-                    .foregroundColor(.orange)
-                    .padding(.bottom, 8)
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 10))
+                    Text(error)
+                        .font(.system(size: 11))
+                }
+                .foregroundColor(.orange)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
 
-            // Only show usage if data has been fetched
             if !usageManager.hasFetchedData {
-                Text("👋 Welcome! Set your session cookie below to get started.")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .padding(.vertical, 8)
-            }
-
-            // Session Usage
-            if usageManager.hasFetchedData {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Session (5 hour)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.sessionResetsAt {
-                        Text("Resets \(formatResetTime(resetTime))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                ProgressView(value: usageManager.sessionPercentage)
-                    .tint(colorForPercentage(usageManager.sessionPercentage))
-
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            // Weekly Usage
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Weekly (7 day)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.weeklyResetsAt {
-                        Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                ProgressView(value: usageManager.weeklyPercentage)
-                    .tint(colorForPercentage(usageManager.weeklyPercentage))
-
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            // Weekly Sonnet Usage (only show if available)
-            if usageManager.hasWeeklySonnet && usageManager.hasFetchedData {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Sonnet (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklySonnetResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    ProgressView(value: usageManager.weeklySonnetPercentage)
-                        .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
-
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
-                        .font(.caption)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Welcome")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("Set your session cookie below to get started.")
+                        .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
-            }
+                .padding(.vertical, 4)
             }
 
             if usageManager.hasFetchedData {
-            Divider()
+                VStack(spacing: 10) {
+                    UsageCard(
+                        title: "Session",
+                        badge: "5h",
+                        percentage: usageManager.sessionPercentage,
+                        resetText: usageManager.sessionResetsAt.map { "Resets \(formatResetTime($0))" },
+                        showExtraUsageWarning: usageManager.sessionUsage >= 99
+                    )
 
-            HStack {
-                Text("Last updated: \(formatTime(usageManager.lastUpdated))")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Button("Refresh") {
-                    usageManager.fetchUsage()
+                    UsageCard(
+                        title: "Weekly",
+                        badge: "7d",
+                        percentage: usageManager.weeklyPercentage,
+                        resetText: usageManager.weeklyResetsAt.map { "Resets \(formatResetTime($0, includeDate: true))" },
+                        showExtraUsageWarning: false
+                    )
+
+                    if usageManager.hasWeeklySonnet {
+                        UsageCard(
+                            title: "Weekly Sonnet",
+                            badge: "7d",
+                            percentage: usageManager.weeklySonnetPercentage,
+                            resetText: usageManager.weeklySonnetResetsAt.map { "Resets \(formatResetTime($0, includeDate: true))" },
+                            showExtraUsageWarning: false
+                        )
+                    }
                 }
-                .buttonStyle(.borderless)
-                .font(.caption)
-            }
+
+                Text("Updated \(formatTime(usageManager.lastUpdated))")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             }
 
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
-                showingCookieInput.toggle()
+            Divider().opacity(0.5)
+
+            HStack(spacing: 14) {
+                Button(action: { showingCookieInput.toggle() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "key.fill")
+                            .font(.system(size: 9))
+                        Text(showingCookieInput ? "Hide Cookie" : "Set Cookie")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+
+                Button(action: { showingSettings.toggle() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 9))
+                        Text(showingSettings ? "Hide Settings" : "Settings")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
             }
-            .buttonStyle(.borderless)
-            .font(.caption)
 
             if showingCookieInput {
                 VStack(alignment: .leading, spacing: 8) {
@@ -974,30 +1128,16 @@ struct UsageView: View {
                         }
                     }
                 }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.primary.opacity(0.05))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                )
             }
-
-            // Support Section
-            Button(action: {
-                NSWorkspace.shared.open(URL(string: "https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02")!)
-            }) {
-                HStack(spacing: 4) {
-                    Text("☕")
-                    Text("Buy Dev a Coffee")
-                }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .foregroundColor(.orange)
-
-            // Settings Section
-            Button(showingSettings ? "Hide Settings" : "Settings") {
-                showingSettings.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
 
             if showingSettings {
                 VStack(alignment: .leading, spacing: 12) {
@@ -1029,7 +1169,7 @@ struct UsageView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Enable Notifications")
                                     .font(.caption)
-                                Text("Get alerts at 25%, 50%, 75%,\nand 90% session usage")
+                                Text("Session alerts at 25/50/75/90%.\nAt 99%: alert on each chat turn in extra usage.")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -1082,12 +1222,18 @@ struct UsageView: View {
                         }
                     }
                 }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.primary.opacity(0.05))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                )
             }
         }
-        .padding()
+        .padding(16)
         .frame(width: 360)
         .onAppear {
             // Load saved cookie when view appears
